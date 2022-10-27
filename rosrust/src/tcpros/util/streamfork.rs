@@ -2,10 +2,10 @@ use crate::util::lossy_channel::{lossy_channel, LossyReceiver, LossySender};
 use crate::util::FAILED_TO_LOCK;
 use crossbeam::channel::{self, unbounded, Receiver, Sender};
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
-pub fn fork<T: Write + Send + 'static>(queue_size: usize) -> (TargetList<T>, DataStream) {
+pub fn fork<T: Write + Send + Sync + 'static>(queue_size: usize) -> (TargetList<T>, DataStream) {
     let (streams_sender, streams) = unbounded();
     let (data_sender, data) = lossy_channel(queue_size);
 
@@ -24,11 +24,11 @@ pub fn fork<T: Write + Send + 'static>(queue_size: usize) -> (TargetList<T>, Dat
 }
 
 struct ForkThread<T: Write + Send + 'static> {
-    targets: Vec<SubscriberInfo<T>>,
+    targets: Vec<Arc<RwLock<SubscriberInfo<T>>>>,
     target_names: Arc<Mutex<TargetNames>>,
 }
 
-impl<T: Write + Send + 'static> ForkThread<T> {
+impl<T: Write + Send + Sync + 'static> ForkThread<T> {
     pub fn new() -> Self {
         Self {
             targets: vec![],
@@ -38,25 +38,25 @@ impl<T: Write + Send + 'static> ForkThread<T> {
         }
     }
 
-    fn publish_buffer_and_prune_targets(&mut self, buffer: &[u8]) {
-        let mut dropped_targets = vec![];
-        for (idx, target) in self.targets.iter_mut().enumerate() {
-            if target.stream.write_all(buffer).is_err() {
-                dropped_targets.push(idx);
-            }
-        }
-
-        if !dropped_targets.is_empty() {
-            // We reverse the order, to remove bigger indices first.
-            for idx in dropped_targets.into_iter().rev() {
-                self.targets.swap_remove(idx);
-            }
-            self.update_target_names();
+    fn publish_buffer_and_prune_targets(&mut self, buffer: Arc<Vec<u8>>) {
+        self.targets
+            .retain(|target| !target.read().unwrap().dropped);
+        self.update_target_names();
+        for target in &self.targets {
+            let buffer = buffer.clone();
+            let target = target.clone();
+            smol::unblock(move || {
+                let mut target = target.write().unwrap();
+                if target.stream.write_all(&buffer).is_err() {
+                    target.dropped = true;
+                }
+            })
+            .detach();
         }
     }
 
     fn add_target(&mut self, target: SubscriberInfo<T>) {
-        self.targets.push(target);
+        self.targets.push(Arc::new(RwLock::new(target)));
         self.update_target_names();
     }
 
@@ -64,7 +64,7 @@ impl<T: Write + Send + 'static> ForkThread<T> {
         let targets = self
             .targets
             .iter()
-            .map(|target| target.caller_id.clone())
+            .map(|target| target.read().unwrap().caller_id.clone())
             .collect();
         *self.target_names.lock().expect(FAILED_TO_LOCK) = TargetNames { targets };
     }
@@ -79,7 +79,7 @@ impl<T: Write + Send + 'static> ForkThread<T> {
                 return msg.and(Err(channel::RecvError));
             }
             recv(data.data_rx) -> msg => {
-                self.publish_buffer_and_prune_targets(&msg?);
+                self.publish_buffer_and_prune_targets(msg?);
             }
             recv(streams) -> target => {
                 self.add_target(target?);
@@ -104,7 +104,11 @@ pub struct TargetList<T: Write + Send + 'static>(Sender<SubscriberInfo<T>>);
 impl<T: Write + Send + 'static> TargetList<T> {
     pub fn add(&self, caller_id: String, stream: T) -> ForkResult {
         self.0
-            .send(SubscriberInfo { caller_id, stream })
+            .send(SubscriberInfo {
+                caller_id,
+                stream,
+                dropped: false,
+            })
             .or(Err(()))
     }
 }
@@ -112,6 +116,7 @@ impl<T: Write + Send + 'static> TargetList<T> {
 struct SubscriberInfo<T> {
     caller_id: String,
     stream: T,
+    dropped: bool,
 }
 
 #[derive(Clone)]
