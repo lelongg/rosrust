@@ -10,6 +10,7 @@ use log::error;
 use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::{atomic, Arc, Mutex};
+use std::time::Duration;
 
 pub struct Publisher {
     subscriptions: DataStream,
@@ -155,6 +156,12 @@ impl Publisher {
                 if !publisher_exists.load(atomic::Ordering::SeqCst) {
                     return tcpconnection::Feedback::StopAccepting;
                 }
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
                 process_subscriber(
                     &topic,
                     stream,
